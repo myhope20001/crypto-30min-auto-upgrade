@@ -8,16 +8,31 @@ import time
 from datetime import datetime
 import lightgbm as lgb
 
-st.set_page_config(page_title="Adaptive AI Crypto Trader",layout="wide")
+st.set_page_config(page_title="AI Crypto Trader",layout="wide")
 
 DB="ai_trader.db"
 
 conn=sqlite3.connect(DB,check_same_thread=False)
 cur=conn.cursor()
 
-# ---------------------------
-# DB
-# ---------------------------
+# -----------------------------
+# DB 생성
+# -----------------------------
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS wallet(
+id INTEGER PRIMARY KEY,
+krw REAL
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS positions(
+ticker TEXT PRIMARY KEY,
+qty REAL,
+buy_price REAL
+)
+""")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS trades(
@@ -43,96 +58,100 @@ target INTEGER
 )
 """)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS strategy(
-id INTEGER PRIMARY KEY,
-buy_threshold REAL,
-sell_threshold REAL,
-max_risk REAL
-)
-""")
-
 conn.commit()
 
-# 초기 전략
+# -----------------------------
+# 최초 지갑 생성
+# -----------------------------
 
-if len(pd.read_sql("SELECT * FROM strategy",conn))==0:
+wallet_df=pd.read_sql("SELECT * FROM wallet",conn)
+
+if len(wallet_df)==0:
 
     cur.execute(
-    "INSERT INTO strategy VALUES(1,0.6,0.45,0.25)"
+    "INSERT INTO wallet VALUES(1,10000000)"
     )
 
     conn.commit()
 
-# ---------------------------
-# wallet
-# ---------------------------
+# -----------------------------
+# wallet load/save
+# -----------------------------
 
-if "wallet" not in st.session_state:
+def load_wallet():
 
-    st.session_state.wallet={
-        "krw":10000000.0,
-        "positions":{}
-    }
+    df=pd.read_sql("SELECT * FROM wallet WHERE id=1",conn)
 
-wallet=st.session_state.wallet
+    return float(df.iloc[0]["krw"])
 
-# ---------------------------
+def save_wallet(krw):
+
+    cur.execute(
+    "UPDATE wallet SET krw=? WHERE id=1",
+    (krw,)
+    )
+
+    conn.commit()
+
+# -----------------------------
+# positions load
+# -----------------------------
+
+def load_positions():
+
+    df=pd.read_sql("SELECT * FROM positions",conn)
+
+    pos={}
+
+    for _,r in df.iterrows():
+
+        pos[r.ticker]={
+        "qty":r.qty,
+        "buy_price":r.buy_price
+        }
+
+    return pos
+
+# -----------------------------
 # indicators
-# ---------------------------
+# -----------------------------
 
 def indicators(df):
 
-    df["rsi"]=100-(100/(1+(df.close.diff().clip(lower=0).rolling(14).mean()/(-df.close.diff().clip(upper=0).rolling(14).mean()))))
+    df["ma5"]=df.close.rolling(5).mean()
+    df["ma20"]=df.close.rolling(20).mean()
 
-    df["ema5"]=df.close.ewm(span=5).mean()
-    df["ema20"]=df.close.ewm(span=20).mean()
+    delta=df.close.diff()
 
-    df["macd"]=df.ema5-df.ema20
-    df["macd_signal"]=df.macd.ewm(span=9).mean()
+    up=delta.clip(lower=0)
+    down=-delta.clip(upper=0)
 
-    df["roc"]=df.close.pct_change(5)
+    rs=up.rolling(14).mean()/down.rolling(14).mean()
 
-    df["vol_mean"]=df.volume.rolling(20).mean()
-    df["vol_ratio"]=df.volume/df.vol_mean
+    df["rsi"]=100-(100/(1+rs))
 
     df["momentum"]=df.close.pct_change(3)
 
-    df["boll_mid"]=df.close.rolling(20).mean()
-    df["boll_std"]=df.close.rolling(20).std()
-
-    df["boll_gap"]=(df.close-df.boll_mid)/df.boll_std
-
     return df
 
-# ---------------------------
+# -----------------------------
 # feature
-# ---------------------------
+# -----------------------------
 
 def features(df):
 
     r=df.iloc[-1]
 
-    f=[
-        r.rsi,
-        r.ema5/r.close,
-        r.ema20/r.close,
-        r.macd,
-        r.macd_signal,
-        r.roc,
-        r.vol_ratio,
-        r.momentum,
-        r.boll_gap
-    ]
+    f=[r.rsi,r.ma5/r.close,r.ma20/r.close,r.momentum]
 
     while len(f)<30:
         f.append(np.random.random())
 
     return f[:30]
 
-# ---------------------------
-# tradable coins
-# ---------------------------
+# -----------------------------
+# tradable
+# -----------------------------
 
 def tradable():
 
@@ -142,9 +161,9 @@ def tradable():
 
     return [x["market"] for x in res if x["market"].startswith("KRW-")]
 
-# ---------------------------
+# -----------------------------
 # 거래대금 상위
-# ---------------------------
+# -----------------------------
 
 def top100():
 
@@ -169,9 +188,9 @@ def top100():
 
     return [x[0] for x in data[:100]]
 
-# ---------------------------
+# -----------------------------
 # learning build
-# ---------------------------
+# -----------------------------
 
 def build_learning():
 
@@ -204,9 +223,9 @@ def build_learning():
 
     conn.commit()
 
-# ---------------------------
+# -----------------------------
 # train
-# ---------------------------
+# -----------------------------
 
 def train():
 
@@ -216,13 +235,13 @@ def train():
         return None
 
     X=df.drop(["id","target"],axis=1)
+
     y=df["target"]
 
     d=lgb.Dataset(X,label=y)
 
     params={
     "objective":"binary",
-    "metric":"auc",
     "learning_rate":0.03,
     "num_leaves":64
     }
@@ -231,77 +250,34 @@ def train():
 
     return model
 
-# ---------------------------
-# 전략 자동 수정
-# ---------------------------
+# -----------------------------
+# 자동 학습 (30분)
+# -----------------------------
 
-def adapt_strategy():
+def auto_learning():
 
-    hist=pd.read_sql("SELECT * FROM trades",conn)
+    now=int(time.time())
 
-    if len(hist)<50:
-        return
+    if now%1800<15:
 
-    hist["value"]=hist.price*hist.qty
+        build_learning()
 
-    buy=hist[hist.side=="BUY"]["value"].sum()
-    sell=hist[hist.side=="SELL"]["value"].sum()
-
-    profit=sell-buy
-
-    strat=pd.read_sql("SELECT * FROM strategy",conn).iloc[0]
-
-    buy_th=strat.buy_threshold
-    sell_th=strat.sell_threshold
-    risk=strat.max_risk
-
-    if profit<0:
-
-        buy_th=min(0.7,buy_th+0.02)
-        risk=max(0.05,risk-0.02)
-
-    else:
-
-        buy_th=max(0.55,buy_th-0.01)
-        risk=min(0.30,risk+0.01)
-
-    cur.execute(
-    "UPDATE strategy SET buy_threshold=?,sell_threshold=?,max_risk=? WHERE id=1",
-    (buy_th,sell_th,risk)
-    )
-
-    conn.commit()
-
-# ---------------------------
-# Kelly
-# ---------------------------
-
-def position_size(prob,risk):
-
-    edge=(prob*2)-1
-
-    if edge<=0:
-        return 0
-
-    k=edge*risk
-
-    return min(k,risk)
-
-# ---------------------------
+# -----------------------------
 # trading
-# ---------------------------
+# -----------------------------
 
 def trade(model):
 
-    strat=pd.read_sql("SELECT * FROM strategy",conn).iloc[0]
+    krw=load_wallet()
 
-    buy_th=strat.buy_threshold
-    sell_th=strat.sell_threshold
-    risk=strat.max_risk
+    positions=load_positions()
 
     coins=top100()
 
     for coin in coins:
+
+        if coin in positions:
+            continue
 
         df=pyupbit.get_ohlcv(coin,"minute1",count=120)
 
@@ -314,35 +290,39 @@ def trade(model):
 
         prob=model.predict([f])[0]
 
-        size=position_size(prob,risk)
+        if prob<0.6:
+            continue
 
-        if prob>buy_th and size>0:
+        price=pyupbit.get_current_price(coin)
 
-            price=pyupbit.get_current_price(coin)
+        invest=krw*0.1
 
-            invest=wallet["krw"]*size
+        if invest<10000:
+            continue
 
-            if invest<10000:
-                continue
+        qty=invest/price
 
-            qty=invest/price
+        krw-=invest
 
-            wallet["krw"]-=invest
+        save_wallet(krw)
 
-            wallet["positions"][coin]={"qty":qty,"buy_price":price}
+        cur.execute(
+        "INSERT INTO positions VALUES(?,?,?)",
+        (coin,qty,price)
+        )
 
-            cur.execute(
-            "INSERT INTO trades VALUES(NULL,?,?,?,?,?)",
-            (datetime.now(),coin,price,qty,"BUY")
-            )
+        cur.execute(
+        "INSERT INTO trades VALUES(NULL,?,?,?,?,?)",
+        (datetime.now(),coin,price,qty,"BUY")
+        )
 
-            conn.commit()
+        conn.commit()
 
-    # sell
+    # SELL
 
-    for coin in list(wallet["positions"].keys()):
+    positions=load_positions()
 
-        pos=wallet["positions"][coin]
+    for coin,pos in positions.items():
 
         price=pyupbit.get_current_price(coin)
 
@@ -356,13 +336,20 @@ def trade(model):
 
         prob=model.predict([f])[0]
 
-        if prob<sell_th or profit>0.08 or profit<-0.03:
+        if prob<0.45 or profit>0.08 or profit<-0.03:
 
             qty=pos["qty"]
 
-            wallet["krw"]+=qty*price
+            krw=load_wallet()
 
-            del wallet["positions"][coin]
+            krw+=qty*price
+
+            save_wallet(krw)
+
+            cur.execute(
+            "DELETE FROM positions WHERE ticker=?",
+            (coin,)
+            )
 
             cur.execute(
             "INSERT INTO trades VALUES(NULL,?,?,?,?,?)",
@@ -371,25 +358,11 @@ def trade(model):
 
             conn.commit()
 
-# ---------------------------
-# 자동 학습 (30분)
-# ---------------------------
+# -----------------------------
+# 실행
+# -----------------------------
 
-def auto_learning():
-
-    now=int(time.time())
-
-    if now%1800<15:
-
-        build_learning()
-
-        adapt_strategy()
-
-# ---------------------------
-# dashboard
-# ---------------------------
-
-st.title("Adaptive AI Crypto Trader")
+st.title("AI Crypto Trader")
 
 auto_learning()
 
@@ -398,13 +371,19 @@ model=train()
 if model:
     trade(model)
 
-# asset
+# -----------------------------
+# dashboard
+# -----------------------------
+
+krw=load_wallet()
+
+positions=load_positions()
 
 coin_value=0
 
 rows=[]
 
-for coin,pos in wallet["positions"].items():
+for coin,pos in positions.items():
 
     price=pyupbit.get_current_price(coin)
 
@@ -422,13 +401,15 @@ for coin,pos in wallet["positions"].items():
     "profit%":profit
     })
 
-asset=wallet["krw"]+coin_value
+asset=krw+coin_value
 
 c1,c2,c3=st.columns(3)
 
 c1.metric("총 자산",f"{asset:,.0f}")
-c2.metric("현금",f"{wallet['krw']:,.0f}")
+c2.metric("현금",f"{krw:,.0f}")
 c3.metric("코인 평가",f"{coin_value:,.0f}")
+
+st.subheader("보유 코인")
 
 st.dataframe(pd.DataFrame(rows))
 
