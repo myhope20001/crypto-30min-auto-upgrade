@@ -128,22 +128,22 @@ def tradable():
     res = requests.get(url).json()
     coins = [x["market"] for x in res if x["market"].startswith("KRW-")]
     
-    # 상장 7일 미만 제외
+    # 상장 7일 미만/상폐 예정/유의 종목 제외
     seven_days_ago = datetime.now() - timedelta(days=7)
-    new_list = []
+    filtered = []
     for m in res:
-        if m["market"] in coins:
-            try:
-                if "market_warning" in m and m["market_warning"] in ["CAUTION", "DELISTING"]:
+        if m["market"] not in coins: continue
+        try:
+            if "market_warning" in m and m["market_warning"] in ["CAUTION", "DELISTING"]:
+                continue
+            if "listed_date" in m:
+                listed_date = datetime.strptime(m["listed_date"], "%Y-%m-%d")
+                if listed_date > seven_days_ago:
                     continue
-                if "listed_date" in m:
-                    listed_date = datetime.strptime(m["listed_date"], "%Y-%m-%d")
-                    if listed_date > seven_days_ago:
-                        continue
-            except:
-                pass
-            new_list.append(m["market"])
-    return new_list
+        except:
+            pass
+        filtered.append(m["market"])
+    return filtered
 
 def top100():
     coins = tradable()
@@ -245,19 +245,19 @@ def ai_engine():
         model = train()
         if model:
             trade(model)
-        time.sleep(300)  # 5분마다 반복
+        time.sleep(300)
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.title("AI Crypto Trader (백그라운드 24시간)")
+st.title("AI Crypto Trader (총합 이익/매수/매도 표시)")
 
 if "engine_started" not in st.session_state:
     t = threading.Thread(target=ai_engine, daemon=True)
     t.start()
     st.session_state.engine_started = True
 
-# 대시보드
+# 자산/포지션
 krw = load_wallet()
 positions = load_positions()
 coin_value = 0
@@ -268,10 +268,8 @@ for coin,pos in positions.items():
     coin_value += value
     profit = price - pos["buy_price"]
     profit_percent = profit / pos["buy_price"] * 100
-    rows.append({
-        "coin": coin, "qty": pos["qty"], "buy_price": pos["buy_price"],
-        "price": price, "profit": profit, "profit%": profit_percent
-    })
+    rows.append({"coin": coin, "qty": pos["qty"], "buy_price": pos["buy_price"],
+                 "price": price, "profit": profit, "profit%": profit_percent})
 
 asset = krw + coin_value
 c1,c2,c3 = st.columns(3)
@@ -282,8 +280,20 @@ c3.metric("코인 평가", f"{coin_value:,.0f}")
 st.subheader("보유 코인")
 st.dataframe(pd.DataFrame(rows))
 
+# 최근 거래 + 총 매수/매도/총이익
 hist = pd.read_sql("SELECT * FROM trades ORDER BY id DESC LIMIT 50", conn)
-st.subheader("최근 거래 (금액/수익 표시)")
-st.dataframe(hist)
+st.subheader("최근 거래 및 총합")
 
+# 총합 계산
+total_buy = hist[hist.side=="BUY"]["trade_value"].sum()
+total_sell = hist[hist.side=="SELL"]["trade_value"].sum()
+total_profit = hist[hist.side=="SELL"]["profit"].sum()
+total_profit_percent = (total_profit / total_buy * 100) if total_buy>0 else 0
+
+st.metric("총 매수금액", f"{total_buy:,.0f} 원")
+st.metric("총 매도금액", f"{total_sell:,.0f} 원")
+st.metric("총 이익금액", f"{total_profit:,.0f} 원")
+st.metric("총 이익률", f"{total_profit_percent:.2f} %")
+
+st.dataframe(hist)
 st.write("⚠️ Streamlit 종료 후에도 백그라운드 엔진이 5분마다 학습과 매매를 진행하며 DB에 상태를 저장합니다.")
