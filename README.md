@@ -1,0 +1,1 @@
+# crypto-30min-auto-upgrade
